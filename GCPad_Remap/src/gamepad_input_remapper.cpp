@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <atomic>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -68,6 +69,17 @@ static float axisToMouseMotionF(float value, const AxisMouseMapping& mapping) {
     if (mapping.invert) processed = -processed;
     return processed * mapping.sensitivity;
 }
+
+#ifdef __linux__
+// Global error handler state for X11 async error handling
+static std::atomic<int> g_x11_error_occurred{0};
+
+static int x11_error_handler(Display* /*display*/, XErrorEvent* /*event*/) {
+    // Don't crash on X11 errors - game may have grabbed focus
+    g_x11_error_occurred.store(1, std::memory_order_relaxed);
+    return 0;
+}
+#endif
 
 // ── Construction / reset ─────────────────────────────────────────────────────
 
@@ -459,17 +471,46 @@ bool GamepadInputRemapper::sendInput(const GamepadState& current,
 
     return true;
 #elif defined(__linux__)
-    static Display* display = XOpenDisplay(nullptr);
+    // FIX: Open and close X11 display per-call instead of caching.
+    // When a game launches fullscreen, it takes control of X11 and the
+    // cached display handle becomes invalid, causing X11 calls to block.
+    // Also set up error handler to prevent crashes on X11 errors.
+    g_x11_error_occurred.store(0, std::memory_order_relaxed);
+    XSetErrorHandler(x11_error_handler);
+    
+    Display* display = XOpenDisplay(nullptr);
     if (!display) {
+        XSetErrorHandler(nullptr);
         return false;
     }
 
+    // Check if error occurred during display open
+    if (g_x11_error_occurred.load(std::memory_order_relaxed)) {
+        XCloseDisplay(display);
+        XSetErrorHandler(nullptr);
+        return false;
+    }
+
+    // Try to get input focus - this may fail during game launch
     Window root = DefaultRootWindow(display);
-    Window focus;
-    int revert_to;
+    Window focus = 0;
+    int revert_to = 0;
+    
+    // Use XGetInputFocus with error checking
     XGetInputFocus(display, &focus, &revert_to);
+    int focus_error = XSync(display, False);
+    if (g_x11_error_occurred.load(std::memory_order_relaxed)) {
+        XCloseDisplay(display);
+        XSetErrorHandler(nullptr);
+        return false;
+    }
 
     for (const auto& e : events) {
+        // Skip further processing if error occurred
+        if (g_x11_error_occurred.load(std::memory_order_relaxed)) {
+            break;
+        }
+        
         switch (e.type) {
             case GamepadInputEvent::Type::Keyboard: {
                 KeyCode keycode = static_cast<KeyCode>(e.keyboard.virtual_key);
@@ -511,7 +552,9 @@ bool GamepadInputRemapper::sendInput(const GamepadState& current,
     }
 
     XFlush(display);
-    return true;
+    XCloseDisplay(display);
+    XSetErrorHandler(nullptr);
+    return !g_x11_error_occurred.load(std::memory_order_relaxed);
 #else
     (void)events;
     return false;
@@ -541,16 +584,34 @@ std::string GamepadInputRemapper::virtualKeyName(uint16_t vk) {
     snprintf(buf, sizeof(buf), "VK_0x%02X", vk);
     return buf;
 #elif defined(__linux__)
-    static Display* display = XOpenDisplay(nullptr);
+    // FIX: Open and close display per-call instead of caching.
+    // This ensures we get a fresh connection that works even after
+    // a game has taken control of X11.
+    Display* display = XOpenDisplay(nullptr);
     if (!display) {
         char buf[32];
         snprintf(buf, sizeof(buf), "VK_0x%02X", vk);
         return buf;
     }
+    
+    g_x11_error_occurred.store(0, std::memory_order_relaxed);
+    XSetErrorHandler(x11_error_handler);
+    
     KeyCode keycode = static_cast<KeyCode>(vk);
-    KeySym keysym = XKeycodeToKeysym(display, keycode, 0);
+    // Use XGetKeyboardMapping as fallback for XKeycodeToKeysym deprecation
+    KeySym keysym = 0;
+    int keysyms_per_keycode_return = 0;
+    KeySym* keysym_map = XGetKeyboardMapping(display, keycode, 1, &keysyms_per_keycode_return);
+    if (keysym_map && keysyms_per_keycode_return > 0) {
+        keysym = keysym_map[0];
+        XFree(keysym_map);
+    }
     const char* name = XKeysymToString(keysym);
-    if (name) {
+    
+    XSetErrorHandler(nullptr);
+    XCloseDisplay(display);
+    
+    if (name && !g_x11_error_occurred.load(std::memory_order_relaxed)) {
         return std::string(name);
     }
     char buf[32];

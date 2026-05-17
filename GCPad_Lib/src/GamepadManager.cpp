@@ -12,6 +12,7 @@
 
 #include <thread>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <algorithm>
 #include <set>
@@ -54,7 +55,7 @@ private:
 
     std::thread hotplug_thread_;
     std::atomic<bool> hotplug_running_;
-    mutable std::mutex mutex_;
+    mutable std::timed_mutex mutex_;
 
     GamepadConnectedCallback connected_callback_;
     GamepadDisconnectedCallback disconnected_callback_;
@@ -103,7 +104,7 @@ GamepadManagerImpl::~GamepadManagerImpl() {
 }
 
 bool GamepadManagerImpl::initialize() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
 
     // Initialize SDL2 first so we know which devices SDL has already
     // claimed before we try to open them via raw HID. On Windows, both
@@ -197,7 +198,7 @@ void GamepadManagerImpl::shutdown() {
     }
 
     // Now safe to lock — hotplug thread is dead
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
 
     for (auto& gamepad : gamepads_) {
         gamepad.reset();
@@ -223,7 +224,7 @@ void GamepadManagerImpl::shutdown() {
 }
 
 int GamepadManagerImpl::getConnectedGamepadCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
 
     int count = 0;
     for (const auto& gamepad : gamepads_) {
@@ -235,7 +236,7 @@ int GamepadManagerImpl::getConnectedGamepadCount() const {
 }
 
 std::vector<int> GamepadManagerImpl::getConnectedGamepadIndices() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
 
     std::vector<int> indices;
     for (int i = 0; i < MAX_GAMEPADS; ++i) {
@@ -247,7 +248,7 @@ std::vector<int> GamepadManagerImpl::getConnectedGamepadIndices() const {
 }
 
 GamepadDevice* GamepadManagerImpl::getGamepad(int index) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
 
     if (index >= 0 && index < MAX_GAMEPADS && gamepads_[index]) {
         return gamepads_[index].get();
@@ -256,7 +257,7 @@ GamepadDevice* GamepadManagerImpl::getGamepad(int index) {
 }
 
 const GamepadDevice* GamepadManagerImpl::getGamepad(int index) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
 
     if (index >= 0 && index < MAX_GAMEPADS && gamepads_[index]) {
         return gamepads_[index].get();
@@ -265,12 +266,12 @@ const GamepadDevice* GamepadManagerImpl::getGamepad(int index) const {
 }
 
 void GamepadManagerImpl::setGamepadConnectedCallback(GamepadConnectedCallback callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     connected_callback_ = callback;
 }
 
 void GamepadManagerImpl::setGamepadDisconnectedCallback(GamepadDisconnectedCallback callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     disconnected_callback_ = callback;
 }
 
@@ -284,13 +285,13 @@ void GamepadManagerImpl::updateAll() {
 }
 
 void GamepadManagerImpl::setRemapper(std::shared_ptr<Remapper> remapper) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     global_remapper_ = std::move(remapper);
     apply_remapper_to_all();
 }
 
 std::shared_ptr<Remapper> GamepadManagerImpl::getRemapper() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     return global_remapper_;
 }
 
@@ -306,7 +307,13 @@ void GamepadManagerImpl::hotplug_detection_loop() {
     while (hotplug_running_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        // FIX: Use try_lock with timeout to avoid blocking game launch.
+        // SDL enumeration can freeze momentarily when games are starting.
+        std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+        if (!lock.try_lock_for(std::chrono::milliseconds(100))) {
+            // Skip this cycle if mutex is held by another thread
+            continue;
+        }
 
 #ifdef _WIN32
         check_for_new_devices();
